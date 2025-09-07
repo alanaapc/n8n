@@ -90,14 +90,16 @@ async function processEventStream(
 	returnIntermediateSteps: boolean = false,
 	memory?: BaseChatMemory,
 	input?: string,
-): Promise<{ output: string; intermediateSteps?: any[] }> {
-	const agentResult: { output: string; intermediateSteps?: any[] } = {
+): Promise<{ output: string; intermediateSteps?: any[]; toolCalls?: any[] }> {
+	const agentResult: { output: string; intermediateSteps?: any[]; toolCalls?: any[] } = {
 		output: '',
 	};
 
 	if (returnIntermediateSteps) {
 		agentResult.intermediateSteps = [];
 	}
+
+	const toolCalls: any[] = [];
 
 	ctx.sendChunk('begin', itemIndex);
 	for await (const event of eventStream) {
@@ -122,25 +124,42 @@ async function processEventStream(
 				break;
 			case 'on_chat_model_end':
 				// Capture full LLM response with tool calls for intermediate steps
-				if (returnIntermediateSteps && event.data) {
+				if (event.data) {
 					const chatModelData = event.data as any;
 					const output = chatModelData.output;
 
 					// Check if this LLM response contains tool calls
 					if (output?.tool_calls && output.tool_calls.length > 0) {
+						// Collect tool calls for request building
 						for (const toolCall of output.tool_calls) {
-							agentResult.intermediateSteps!.push({
-								action: {
-									tool: toolCall.name,
-									toolInput: toolCall.args,
-									log:
-										output.content ||
-										`Calling ${toolCall.name} with input: ${JSON.stringify(toolCall.args)}`,
-									messageLog: [output], // Include the full LLM response
-									toolCallId: toolCall.id,
-									type: toolCall.type,
-								},
+							toolCalls.push({
+								tool: toolCall.name,
+								toolInput: toolCall.args,
+								toolCallId: toolCall.id,
+								type: toolCall.type,
+								log:
+									output.content ||
+									`Calling ${toolCall.name} with input: ${JSON.stringify(toolCall.args)}`,
+								messageLog: [output],
 							});
+						}
+
+						// Also add to intermediate steps if needed
+						if (returnIntermediateSteps) {
+							for (const toolCall of output.tool_calls) {
+								agentResult.intermediateSteps!.push({
+									action: {
+										tool: toolCall.name,
+										toolInput: toolCall.args,
+										log:
+											output.content ||
+											`Calling ${toolCall.name} with input: ${JSON.stringify(toolCall.args)}`,
+										messageLog: [output], // Include the full LLM response
+										toolCallId: toolCall.id,
+										type: toolCall.type,
+									},
+								});
+							}
 						}
 					}
 				}
@@ -167,6 +186,11 @@ async function processEventStream(
 	// Save conversation to memory if memory is connected
 	if (memory && input && agentResult.output) {
 		await memory.saveContext({ input }, { output: agentResult.output });
+	}
+
+	// Include collected tool calls in the result
+	if (toolCalls.length > 0) {
+		agentResult.toolCalls = toolCalls;
 	}
 
 	return agentResult;
@@ -197,7 +221,6 @@ function buildSteps(
 
 	if (response) {
 		const responses = response?.actionResponses;
-		const previousRequests = response?.metadata?.previousRequests;
 		for (const tool of responses.filter(
 			(response) => response.action?.metadata?.itemIndex === itemIndex,
 		)) {
@@ -263,7 +286,6 @@ export async function toolsAgentExecute(
 	this: IExecuteFunctions | ISupplyDataFunctions,
 	response?: Response<RequestResponseMetadata>,
 ): Promise<INodeExecutionData[][] | Request<RequestResponseMetadata>> {
-	const steps: ToolCallData[] = [];
 	this.logger.debug('Executing Tools Agent V2');
 
 	const returnData: INodeExecutionData[] = [];
@@ -379,6 +401,29 @@ export async function toolsAgentExecute(
 					input,
 				);
 
+				// If result contains tool calls, build the request object like the normal flow
+				if (result.toolCalls && result.toolCalls.length > 0) {
+					const connectedSubnodes = this.getSubnodes(NodeConnectionTypes.AiTool);
+					const actions = result.toolCalls.map((toolCall: any) => ({
+						nodeName:
+							connectedSubnodes.find(
+								(node: string) =>
+									nodeNameToToolName(node).toLowerCase() === toolCall.tool.toLowerCase(),
+							) ?? toolCall.tool,
+						input: toolCall.toolInput,
+						type: NodeConnectionTypes.AiTool,
+						id: toolCall.toolCallId,
+						metadata: {
+							itemIndex,
+						},
+					}));
+
+					return {
+						actions,
+						metadata: { previousRequests: buildSteps(response, itemIndex) },
+					};
+				}
+
 				return result;
 			} else {
 				// Handle regular execution
@@ -428,7 +473,7 @@ export async function toolsAgentExecute(
 
 				return {
 					actions,
-					metadata: { previousRequests: steps ?? [] },
+					metadata: { previousRequests: buildSteps(response, itemIndex) },
 				};
 			}
 		});
