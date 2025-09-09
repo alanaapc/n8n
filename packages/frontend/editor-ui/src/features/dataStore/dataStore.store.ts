@@ -169,19 +169,21 @@ export const useDataStoreStore = defineStore(DATA_STORE_STORE, () => {
 		projectId: string,
 		page: number,
 		pageSize: number,
+		sortBy: string,
 	) => {
 		return await getDataStoreRowsApi(rootStore.restApiContext, datastoreId, projectId, {
 			skip: (page - 1) * pageSize,
 			take: pageSize,
+			sortBy,
 		});
 	};
 
-	const insertEmptyRow = async (dataStore: DataStore) => {
+	const insertEmptyRow = async (dataStoreId: string, projectId: string) => {
 		const inserted = await insertDataStoreRowApi(
 			rootStore.restApiContext,
-			dataStore.id,
+			dataStoreId,
 			{},
-			dataStore.projectId,
+			projectId,
 		);
 		return inserted[0];
 	};
